@@ -99,6 +99,9 @@ tbody tr[data-selected="true"] { background: color-mix(in srgb, var(--accent) 8%
 
 .model { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; }
+/* The calibration table states measurements; its rows open nothing, so they take no pointer or hover. */
+.model tbody tr { cursor: default; }
+.model tbody tr:hover { background: transparent; }
 .empty { padding: var(--step-7) var(--step-5); text-align: center; display: grid; gap: var(--step-3); justify-items: center; }
 .empty p { color: var(--muted); }
 .button { min-height: 36px; padding: 0 var(--step-4); border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface); }
