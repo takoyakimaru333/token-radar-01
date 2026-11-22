@@ -143,11 +143,15 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  implied_low_usd: number;
+  implied_high_usd: number;
   category_multiple: number;
   peer_count: number;
   peer_median: number | null;
   growth_multiplier: number;
   maturity_multiplier: number;
+  watchlist: boolean;
+  why: string;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -210,6 +214,27 @@ function median(values: number[]): number {
   return s.length % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
 }
 
+/** The nearest-rank percentile of a non-empty list: the smallest value at or above rank q. */
+function percentile(values: number[], q: number): number {
+  const s = [...values].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.max(0, Math.ceil(q * s.length) - 1))]!;
+}
+
+/**
+ * One row's derivation in a single sentence, for the dashboard's detail view: where the
+ * multiple came from, what growth and maturity did to it, and the number they produce.
+ * The sentence is generated from the row's own model block, so it cannot drift from the
+ * arithmetic that priced the row.
+ */
+export function explainRow(row: BoardRow): string {
+  const m = row.model;
+  const origin = m.peer_count > 0
+    ? `a multiple of ${m.category_multiple} calibrated on ${m.peer_count} trading peer${m.peer_count === 1 ? '' : 's'} in ${row.category ?? 'its category'}`
+    : `the global median multiple of ${m.category_multiple}, because no protocol in ${row.category ?? 'its category'} trades in this snapshot`;
+  const growth = m.growth_pct === 0 ? 'no seven-day growth adjustment' : `a ${m.growth_pct}% seven-day move (x${m.growth_multiplier})`;
+  return `${row.name} is priced from ${origin}, ${growth} and a maturity factor of x${m.maturity_multiplier} for ${m.age_days === null ? 'an unknown time' : `${m.age_days} days`} with no token on record.`;
+}
+
 /**
  * What the snapshot's own trading protocols say a dollar of TVL is worth, per category.
  * Peers are protocols with a recorded market cap; their ratio is mcap / TVL. Each category's
@@ -228,8 +253,7 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
   // because their recorded TVL is a sliver of their business. Left raw, one such print would set
   // a whole category's price; capped at the 95th percentile it still counts, at the edge of what
   // the market demonstrably pays.
-  const sortedRatios = raw.map((r) => r.ratio).sort((a, b) => a - b);
-  const cap = sortedRatios.length > 0 ? sortedRatios[Math.min(sortedRatios.length - 1, Math.ceil(0.95 * sortedRatios.length) - 1)]! : 0.25;
+  const cap = raw.length > 0 ? percentile(raw.map((r) => r.ratio), 0.95) : 0.25;
   const byCategory = new Map<string, number[]>();
   const all: number[] = [];
   for (const r of raw) {
@@ -429,7 +453,29 @@ function weeklyFor(p: SnapshotProtocol, capital: number): string {
 }
 
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
+ * The risk that belongs to this category, in its own terms. Every plan names the way its own
+ * position can lose money, because a plan that lists only rewards teaches the reader to skip
+ * the one step that protects the rest: liquidation for lenders, impermanent loss for pools,
+ * depeg for stables, redemption queues for real-world assets, and so on down the categories.
+ */
+function riskFor(p: SnapshotProtocol): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Know the liquidation line before you supply: if the collateral behind your position on ${name} falls to its liquidation threshold, the position is sold automatically and at a penalty, so keep the loan-to-value low enough to survive a bad week.`;
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged')) return `Price both sides of the pool before you add liquidity on ${name}: when the pair moves apart, the pool hands you more of the falling asset (impermanent loss), and a week of fees may not repay a hard move.`;
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('option')) return `Size the hedge so a liquidation cannot take the whole deposit: on ${name} a leveraged position is closed automatically at its maintenance margin, and funding can charge you every hour you hold it.`;
+  if (c.includes('staking') || c.includes('restak')) return `Read the unbonding period and the slashing terms on ${name} before you stake: the receipt asset can trade below the staked asset, and a validator's fault can be charged to everyone who delegated to it.`;
+  if (c.includes('curator') || c.includes('allocator')) return `Check what the vault on ${name} actually holds before you deposit: a curator allocates other people's money into markets it chooses, and losses in those markets are shared by the vault's depositors.`;
+  if (c.includes('rwa')) return `Check the redemption terms on ${name} before you mint: real-world assets often redeem on a schedule, sometimes with identity checks, so the position may not be sellable the week you want out.`;
+  if (c.includes('prediction')) return `Treat the stake on ${name} as money that can go to zero: a prediction position pays only if the outcome lands your way, and most markets settle at nothing for the losing side.`;
+  if (c.includes('stable')) return `Hold only what you can afford to see depeg: the stable asset behind ${name} is a promise backed by reserves you cannot audit from the app, and stablecoins have broken their peg before.`;
+  if (c.includes('bridge')) return `Move a test amount across ${name} first and wait for it to arrive: bridges hold the original asset in a contract while the copy travels, and that contract is the part that gets attacked.`;
+  if (c.includes('insurance')) return `Read what the cover on ${name} actually pays for before you rely on it: most policies name specific failures, and a loss outside the wording is not compensated.`;
+  return `Keep the position on ${name} small enough that a contract failure is survivable: an unaudited or freshly upgraded contract is the standing risk of every pre-token protocol, whatever its category.`;
+}
+
+/**
+ * A protocol's farm plan: eight steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of
  * names: the opening action and the weekly action follow the category, the capital follows the
  * TVL tier, the hold follows the age, and one step is the safety rule every pre-token farm
@@ -467,6 +513,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '10 minutes',
     },
     {
+      text: riskFor(p),
+      cost: 'nothing to check, and it sizes every other step',
+      time: '10 minutes, before the first deposit',
+    },
+    {
       text: `Never sign a claim, an airdrop check or an approval from a search result, an ad or a direct message: a protocol with no token yet is the easiest to impersonate, so reach ${p.name} only through its own app.`,
       cost: 'nothing, and it protects the whole position',
       time: 'every time, before signing',
@@ -496,8 +547,18 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
+/**
+ * The same row priced at a different multiple: the sensitivity the detail view shows, so a
+ * reader sees a range (the multiple a quarter lower, the multiple a quarter higher) instead
+ * of one point estimate pretending to be exact.
+ */
+function impliedAt(row: BoardRow, multiple: number): number {
+  const m = row.model;
+  return Math.max(1, Math.round(row.tvl_usd * multiple * m.growth_multiplier * m.maturity_multiplier));
+}
+
 /** A board row's compact form for data.js, with the farm plan generated in the page. */
-export function radarRow(row: BoardRow): RadarRow {
+export function radarRow(row: BoardRow, watchlist: ReadonlySet<string>): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -510,11 +571,15 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    implied_low_usd: impliedAt(row, row.model.category_multiple * 0.75),
+    implied_high_usd: impliedAt(row, row.model.category_multiple * 1.25),
     category_multiple: row.model.category_multiple,
     peer_count: row.model.peer_count,
     peer_median: row.model.peer_median,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    watchlist: watchlist.has(row.slug),
+    why: explainRow(row),
   };
 }
 
@@ -535,7 +600,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
-    rows: board.map(radarRow),
+    rows: board.map((row) => radarRow(row, new Set(snapshot.watchlist))),
     live,
   };
   return { board, radar };
