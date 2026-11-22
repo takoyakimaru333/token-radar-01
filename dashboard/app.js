@@ -7,7 +7,7 @@
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
-  var state = { q: '', category: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
+  var state = { q: '', category: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null, watchlistOnly: false, compare: [] };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -105,6 +105,21 @@
     if (c.indexOf('payment') >= 0) return "Once a week, make one real payment through " + name + "'s app, the activity a payments protocol counts.";
     return 'Make one qualifying action each week on ' + name + ', such as a deposit, a swap or a vote, so the wallet\u2019s history is continuous.';
   }
+  function riskFor(p) {
+    var c = (p.category || '').toLowerCase();
+    var name = p.name;
+    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Know the liquidation line before you supply: if the collateral behind your position on ' + name + ' falls to its liquidation threshold, the position is sold automatically and at a penalty, so keep the loan-to-value low enough to survive a bad week.';
+    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('leveraged') >= 0) return 'Price both sides of the pool before you add liquidity on ' + name + ': when the pair moves apart, the pool hands you more of the falling asset (impermanent loss), and a week of fees may not repay a hard move.';
+    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0 || c.indexOf('option') >= 0) return 'Size the hedge so a liquidation cannot take the whole deposit: on ' + name + ' a leveraged position is closed automatically at its maintenance margin, and funding can charge you every hour you hold it.';
+    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return 'Read the unbonding period and the slashing terms on ' + name + ' before you stake: the receipt asset can trade below the staked asset, and a validator\u2019s fault can be charged to everyone who delegated to it.';
+    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Check what the vault on ' + name + ' actually holds before you deposit: a curator allocates other people\u2019s money into markets it chooses, and losses in those markets are shared by the vault\u2019s depositors.';
+    if (c.indexOf('rwa') >= 0) return 'Check the redemption terms on ' + name + ' before you mint: real-world assets often redeem on a schedule, sometimes with identity checks, so the position may not be sellable the week you want out.';
+    if (c.indexOf('prediction') >= 0) return 'Treat the stake on ' + name + ' as money that can go to zero: a prediction position pays only if the outcome lands your way, and most markets settle at nothing for the losing side.';
+    if (c.indexOf('stable') >= 0) return 'Hold only what you can afford to see depeg: the stable asset behind ' + name + ' is a promise backed by reserves you cannot audit from the app, and stablecoins have broken their peg before.';
+    if (c.indexOf('bridge') >= 0) return 'Move a test amount across ' + name + ' first and wait for it to arrive: bridges hold the original asset in a contract while the copy travels, and that contract is the part that gets attacked.';
+    if (c.indexOf('insurance') >= 0) return 'Read what the cover on ' + name + ' actually pays for before you rely on it: most policies name specific failures, and a loss outside the wording is not compensated.';
+    return 'Keep the position on ' + name + ' small enough that a contract failure is survivable: an unaudited or freshly upgraded contract is the standing risk of every pre-token protocol, whatever its category.';
+  }
   function stepText(step) {
     var s = step.text + ' Cost: ' + step.cost + '. Time: ' + step.time + '.';
     if (s.length > 600) s = s.slice(0, 596) + '...';
@@ -122,6 +137,7 @@
       { text: weeklyFor(p, capital), cost: 'about $2 of gas a week', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
       { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
+      { text: riskFor(p), cost: 'nothing to check, and it sizes every other step', time: '10 minutes, before the first deposit' },
       { text: 'Never sign a claim, an airdrop check or an approval from a search result, an ad or a direct message: a protocol with no token yet is the easiest to impersonate, so reach ' + p.name + ' only through its own app.', cost: 'nothing, and it protects the whole position', time: 'every time, before signing' },
       { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' }
     ].map(stepText);
@@ -149,6 +165,7 @@
     var q = state.q.trim().toLowerCase();
     return DATA.rows.filter(function (r) {
       if (state.category !== 'all' && r.category !== state.category) return false;
+      if (state.watchlistOnly && !r.watchlist) return false;
       if (!q) return true;
       var hay = [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase();
       return hay.indexOf(q) >= 0;
@@ -206,12 +223,36 @@
     select.addEventListener('change', function () { state.category = select.value; writeHash(); render(); });
     var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token', onclick: function () { state.tab = 'pre-token'; render(); } });
     var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token', onclick: function () { state.tab = 'live'; render(); } });
+    var only = el('button', { type: 'button', 'aria-pressed': state.watchlistOnly ? 'true' : 'false', text: 'Watchlist only', onclick: function () { state.watchlistOnly = !state.watchlistOnly; render(); } });
+    var csv = el('button', { class: 'button', type: 'button', text: 'Export CSV', onclick: exportCsv });
     return el('div', { class: 'controls' },
-      el('div', { class: 'field' }, el('label', { for: 'q', text: 'Search' }), search),
+      el('div', { class: 'field' }, el('label', { for: 'q', text: 'Search ( / )' }), search),
       el('div', { class: 'field' }, el('label', { for: 'category', text: 'Category' }), select),
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
+      el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Scope' }), el('div', { class: 'tabs' }, only)),
+      el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Take it with you' }), csv),
       el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' : DATA.live.length + ' live-token protocols' })
     );
+  }
+
+  // The board on screen as a file: the rows the filters leave, in the order the sort leaves
+  // them, so a farmer can work the list in a spreadsheet without scraping the page.
+  function exportCsv() {
+    function cell(v) {
+      if (v === null || v === undefined) return '';
+      var s = String(v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+    var lines = ['rank,protocol,category,tvl_usd,change_7d_pct,implied_value_usd,multiple,peers,watchlist'];
+    sortedRows(rows()).forEach(function (r) {
+      lines.push([r.rank, r.name, r.category || '', Math.round(r.tvl_usd), r.change_7d === null ? '' : r.change_7d.toFixed(2), r.implied_value_usd, r.category_multiple, r.peer_count, r.watchlist ? 'yes' : 'no'].map(cell).join(','));
+    });
+    var blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    var a = el('a', { href: URL.createObjectURL(blob), download: 'token-radar-board.csv' });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
   }
 
   function sortHeader(key, label) {
@@ -245,8 +286,13 @@
       },
         el('td', { class: 'num', text: String(r.rank) }),
         el('td', null, el('div', { class: 'name' },
-          el('b', { text: r.name }),
-          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') })
+          el('b', { text: r.name }, r.watchlist ? el('span', { class: 'tag', text: 'watchlist' }) : null),
+          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') }),
+          el('button', {
+            class: 'cmp-btn', type: 'button',
+            text: state.compare.indexOf(r.slug) >= 0 ? 'In compare list' : 'Add to compare',
+            onclick: function (e) { e.stopPropagation(); toggleCompare(r.slug); },
+          })
         )),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
@@ -363,11 +409,14 @@
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
-        el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
+        el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) })),
+        el('div', null, el('span', { text: 'At a multiple 25% lower' }), el('b', { class: 'num', text: fmtUsd(row.implied_low_usd) })),
+        el('div', null, el('span', { text: 'At a multiple 25% higher' }), el('b', { class: 'num', text: fmtUsd(row.implied_high_usd) }))
       ),
       el('p', { class: 'sub', text: row.peer_count > 0
         ? 'The multiple is calibrated on ' + row.peer_count + ' trading peer' + (row.peer_count === 1 ? '' : 's') + ' in ' + (row.category || 'this category') + ' (median mcap / TVL ' + (row.peer_median === null ? 'n/a' : row.peer_median.toFixed(3)) + '), shrunk toward the global median ' + DATA.calibration.global_median.toFixed(3) + '.'
         : 'No protocol in ' + (row.category || 'this category') + ' trades in this snapshot, so the multiple is the global median ' + DATA.calibration.global_median.toFixed(3) + ' measured across ' + DATA.calibration.peer_count + ' trading protocols.' }),
+      el('p', { class: 'why', text: row.why }),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
@@ -386,14 +435,127 @@
     }
   }
 
+  // A shortlist tray: up to three protocols side by side on the figures a farmer actually
+  // chooses between — what it is, what it holds, what the model pays for it, and what the
+  // farm plan would commit. Three is a decision, not a catalogue.
+  function toggleCompare(slug) {
+    var at = state.compare.indexOf(slug);
+    if (at >= 0) state.compare.splice(at, 1);
+    else {
+      if (state.compare.length >= 3) state.compare.shift();
+      state.compare.push(slug);
+    }
+    render();
+  }
+
+  function comparePanel() {
+    if (state.compare.length === 0) return null;
+    var picked = state.compare.map(function (slug) {
+      return DATA.rows.filter(function (r) { return r.slug === slug; })[0];
+    }).filter(Boolean);
+    if (picked.length === 0) return null;
+    function metric(label, read) {
+      return el('tr', null,
+        el('th', { scope: 'row', text: label }),
+        picked.map(function (r) { return el('td', { class: 'num', text: read(r) }); })
+      );
+    }
+    return el('section', { class: 'panel compare', 'aria-label': 'Compare shortlist' },
+      el('div', { class: 'compare-head' },
+        el('h2', { text: 'Compare (' + picked.length + ' of 3)' }),
+        el('button', { class: 'button', type: 'button', text: 'Clear', onclick: function () { state.compare = []; render(); } })
+      ),
+      el('div', { class: 'table-wrap' },
+        el('table', null,
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Figure' }),
+            picked.map(function (r) { return el('th', { scope: 'col', text: r.name }); })
+          )),
+          el('tbody', null,
+            metric('Category', function (r) { return r.category || 'Other'; }),
+            metric('TVL', function (r) { return fmtUsd(r.tvl_usd); }),
+            metric('Seven-day move', function (r) { return fmtPct(r.change_7d); }),
+            metric('Age with no token', function (r) { return fmtAge(r.age_days); }),
+            metric('Category multiple', function (r) { return 'x' + r.category_multiple.toFixed(3); }),
+            metric('Trading peers behind it', function (r) { return String(r.peer_count); }),
+            metric('Implied value', function (r) { return fmtUsd(r.implied_value_usd); }),
+            metric('Implied range (multiple -25% / +25%)', function (r) { return fmtUsd(r.implied_low_usd) + ' - ' + fmtUsd(r.implied_high_usd); }),
+            metric('Farm capital', function (r) { return '$' + capitalFor(r); }),
+            metric('Farm hold', function (r) { return holdDaysFor(r.age_days) + ' days'; })
+          )
+        )
+      )
+    );
+  }
+
+  // The week's extremes, both directions: growth feeds the model's growth multiplier, so the
+  // names moving hardest are the names whose implied values are most sensitive to one week's
+  // weather. Each entry opens the same detail drawer as its board row.
+  function movers() {
+    var withMove = DATA.rows.filter(function (r) { return r.change_7d !== null && r.change_7d !== undefined; });
+    function column(title, list) {
+      return el('div', { class: 'movers-col' },
+        el('h3', { text: title }),
+        list.map(function (r) {
+          return el('button', { class: 'mover', type: 'button', onclick: function () { openDetail(r.slug); } },
+            el('span', { class: 'mover-name', text: r.name }),
+            el('span', { class: 'sub', text: r.category || 'Other' }),
+            el('span', { class: 'num ' + (r.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(r.change_7d) })
+          );
+        })
+      );
+    }
+    var up = withMove.slice().sort(function (a, b) { return b.change_7d - a.change_7d; }).slice(0, 5);
+    var down = withMove.slice().sort(function (a, b) { return a.change_7d - b.change_7d; }).slice(0, 5);
+    return el('section', { class: 'panel movers', 'aria-label': 'Biggest seven-day movers' },
+      column('Moving up this week', up),
+      column('Moving down this week', down)
+    );
+  }
+
+  // A first-reader's guide, kept on the page because the board's numbers invite two classic
+  // misreadings: that an implied value is a forecast, and that a high rank is an instruction.
+  // Four short answers, in the order a new reader asks them.
+  function guidePanel() {
+    var body = el('div', { class: 'guide-body' },
+      el('p', null,
+        el('b', { text: 'What is an implied value? ' }),
+        'Not a price target. It is the market cap a protocol would carry if the market paid it the same multiple of TVL it pays its trading peers today. A protocol far above its peers\u2019 multiple is not predicted to fall, and one far below is not promised to rise; the number says where the model\u2019s centre is, and the detail view shows the range when the multiple moves a quarter either way.'
+      ),
+      el('p', null,
+        el('b', { text: 'Why does the watchlist matter? ' }),
+        'The watchlist is the floor the bounty sets: the largest pre-token protocols, every one covered. The early radar below it is where smaller, younger protocols sit. TVL is not safety — a young protocol with $40M can fail more easily than an old one with $400M — so each row carries its age beside its size, and the farm plan sizes its hold by that age.'
+      ),
+      el('p', null,
+        el('b', { text: 'How do I use a farm plan? ' }),
+        'As a checklist, not a tip. Each plan names the wallet hygiene, the one qualifying action for its category, the weekly habit that keeps the position real, how long to hold, and the risk that belongs to that category. The capital figures are the smallest amounts that make the activity genuine; nothing here is sized to a reader\u2019s portfolio, and no step requires leverage.'
+      ),
+      el('p', null,
+        el('b', { text: 'What can this board not tell me? ' }),
+        'Whether a token will launch at all, when, or on what terms. Most pre-token protocols never issue one, and those that do choose the date themselves. The board ranks the size of the opportunity if one comes; the probability is not in the snapshot, and any tool that prints one is inventing it.'
+      )
+    );
+    var details = el('details', { class: 'panel guide' },
+      el('summary', { text: 'How to read this board' }),
+      body
+    );
+    return details;
+  }
+
   function render() {
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
     shell.appendChild(lede());
+    shell.appendChild(guidePanel());
     shell.appendChild(controls());
+    if (state.tab === 'pre-token') shell.appendChild(movers());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    if (state.tab === 'pre-token') shell.appendChild(modelPanel());
+    if (state.tab === 'pre-token') {
+      var tray = comparePanel();
+      if (tray) shell.appendChild(tray);
+      shell.appendChild(modelPanel());
+    }
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);
@@ -404,5 +566,19 @@
   render();
   window.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && dialog.open) dialog.close();
+    // "/" jumps to the search box from anywhere that is not already typing: the board is a
+    // working list, and a farmer scanning 200 rows should not have to reach for the mouse.
+    if (e.key === '/' && !dialog.open) {
+      var target = e.target;
+      var typing = target && (target.tagName === 'INPUT' || target.tagName === 'SELECT' || target.tagName === 'TEXTAREA');
+      if (!typing) {
+        var box = document.getElementById('q');
+        if (box) {
+          e.preventDefault();
+          box.focus();
+          box.select();
+        }
+      }
+    }
   });
 })();

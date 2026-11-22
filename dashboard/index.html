@@ -3,12 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Token Radar: pre-token protocols ranked by an implied value calibrated from the snapshot's own trading protocols, each with a farm plan that names its costs, its time and its risks.">
 <title>Token Radar: pre-token protocols ranked by implied value</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <a class="skip" href="#board">Skip to the board</a>
 <main id="board" tabindex="-1" aria-busy="true"></main>
+<noscript>
+  <p style="font-family: system-ui, sans-serif; padding: 24px">
+    Token Radar renders its board with JavaScript from data.js, a file written beside this page.
+    The same ranking is in board.json, and every protocol's farm plan is in its row there.
+  </p>
+</noscript>
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>
