@@ -28,14 +28,15 @@
   }
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
-  // The base multiple is the row's own category multiple, calibrated from this snapshot (see the
-  // calibration panel below); growth and maturity follow the stated constants.
+  // The base multiple is the row's category multiple at its category's typical size, calibrated
+  // from this snapshot (see the calibration panel below); the size multiplier moves it to this
+  // row's own TVL along the fitted size slope; growth and maturity follow the stated constants.
   function impliedOf(row, model) {
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-    return Math.max(1, Math.round(row.tvl_usd * row.category_multiple * growthMult * maturity));
+    return Math.max(1, Math.round(row.tvl_usd * row.category_multiple * (row.size_multiplier || 1) * growthMult * maturity));
   }
 
   function el(tag, attrs) {
@@ -350,6 +351,7 @@
   function modelPanel() {
     var m = DATA.model;
     var cal = DATA.calibration;
+    var val = DATA.validation;
     var cats = cal.categories.slice().sort(function (a, b) { return b.peers - a.peers; }).slice(0, 12);
     var tbody = el('tbody');
     cats.forEach(function (c) {
@@ -362,18 +364,20 @@
     });
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'The multiple is not asserted; it is measured from this snapshot. ' + cal.peer_count + ' protocols in the snapshot already trade, so each one prices a dollar of TVL in its category (market cap / TVL). Ratios are winsorised at their 95th percentile (' + cal.ratio_cap.toFixed(2) + '), because a few peers print ratios in the tens or hundreds on a sliver of recorded TVL and one such print must not set a category\u2019s price. The model then takes the category median and shrinks it toward the global median of ' + cal.global_median.toFixed(3) + ' with weight ' + cal.shrink_k + ', so a category with three peers borrows the market centre instead of swinging on three prints. A category with no trading peers uses the global median.' }),
+      el('p', { class: 'sub', text: 'The multiple is not asserted; it is measured from this snapshot. ' + cal.peer_count + ' protocols in the snapshot already trade, so each one prices a dollar of TVL in its category (market cap / TVL). Ratios are winsorised at their 95th percentile (' + cal.ratio_cap.toFixed(2) + '), because a few peers print ratios in the tens or hundreds on a sliver of recorded TVL and one such print must not set a category\u2019s price. The centre is taken in log space (the geometric median), because ratios span orders of magnitude, and shrunk toward the global median of ' + cal.global_median.toFixed(3) + ' with weight ' + cal.shrink_k + ', so a category with three peers borrows the market centre instead of swinging on three prints. A category with no trading peers uses the global median.' }),
+      el('p', { class: 'sub', text: 'Size is priced too: across this snapshot\u2019s peers, the market pays less per TVL dollar the larger a protocol is. The model fits that slope within categories (beta ' + cal.beta.toFixed(2) + ' of log ratio per log of TVL, clamped so it never rewards size) and moves each category\u2019s multiple from its typical size to the protocol\u2019s own size. A protocol ten times its category\u2019s typical size is priced at a lower multiple than a typical one, because that is what the snapshot\u2019s trading protocols show.' }),
       el('div', { class: 'formula' },
-        'multiple = (peers x category median + ' + m.shrink_k + ' x global median) / (peers + ' + m.shrink_k + ');  implied = round( tvl_usd x multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
+        'log multiple = (peers x (category median log + beta x (log TVL - category median log TVL)) + ' + m.shrink_k + ' x (global median log + beta x (log TVL - global median log TVL))) / (peers + ' + m.shrink_k + '), beta = ' + cal.beta.toFixed(2) + ';  implied = round( tvl_usd x 10^log-multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
       ),
+      el('p', { class: 'sub', text: 'Checked against itself: before this board was priced, the model priced each of the ' + val.peers + ' trading protocols in this snapshot blind \u2014 left out of its own calibration \u2014 and compared the price with its actual market cap. The typical miss was a factor of x' + val.median_factor.toFixed(2) + ' (median); ' + val.within_2x_pct + '% of the blind prices landed within 2x of the truth and ' + val.within_3x_pct + '% within 3x. The range on every row is that measured factor, not a round number: half of the blind prices landed inside it. A model that hides its own error is asking to be trusted; this one publishes it.' }),
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: 'Calibration from this snapshot: the best-measured categories. Every other category is calibrated the same way; the detail view of any row shows its own multiple and peer count.' }),
+          el('caption', { class: 'sub', text: 'Calibration from this snapshot: the best-measured categories. The median is geometric (in log space) and the multiple is stated at each category\u2019s typical size, before the size slope moves it to a row\u2019s own TVL. Every other category is calibrated the same way; the detail view of any row shows its own multiple, size factor and peer count.' }),
           el('thead', null, el('tr', null,
             el('th', { scope: 'col', text: 'Category' }),
             el('th', { scope: 'col', text: 'Trading peers' }),
             el('th', { scope: 'col', text: 'Median mcap / TVL' }),
-            el('th', { scope: 'col', text: 'Multiple used' })
+            el('th', { scope: 'col', text: 'Multiple at typical size' })
           )),
           tbody
         )
@@ -405,17 +409,18 @@
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: row.category_multiple.toFixed(3) })),
+        el('div', null, el('span', { text: 'Size multiplier' }), el('b', { class: 'num', text: 'x' + (row.size_multiplier || 1).toFixed(3) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) })),
-        el('div', null, el('span', { text: 'At a multiple 25% lower' }), el('b', { class: 'num', text: fmtUsd(row.implied_low_usd) })),
-        el('div', null, el('span', { text: 'At a multiple 25% higher' }), el('b', { class: 'num', text: fmtUsd(row.implied_high_usd) }))
+        el('div', null, el('span', { text: 'Measured range, low' }), el('b', { class: 'num', text: fmtUsd(row.implied_low_usd) })),
+        el('div', null, el('span', { text: 'Measured range, high' }), el('b', { class: 'num', text: fmtUsd(row.implied_high_usd) }))
       ),
       el('p', { class: 'sub', text: row.peer_count > 0
-        ? 'The multiple is calibrated on ' + row.peer_count + ' trading peer' + (row.peer_count === 1 ? '' : 's') + ' in ' + (row.category || 'this category') + ' (median mcap / TVL ' + (row.peer_median === null ? 'n/a' : row.peer_median.toFixed(3)) + '), shrunk toward the global median ' + DATA.calibration.global_median.toFixed(3) + '.'
-        : 'No protocol in ' + (row.category || 'this category') + ' trades in this snapshot, so the multiple is the global median ' + DATA.calibration.global_median.toFixed(3) + ' measured across ' + DATA.calibration.peer_count + ' trading protocols.' }),
+        ? 'The multiple is calibrated on ' + row.peer_count + ' trading peer' + (row.peer_count === 1 ? '' : 's') + ' in ' + (row.category || 'this category') + ' (geometric median mcap / TVL ' + (row.peer_median === null ? 'n/a' : row.peer_median.toFixed(3)) + '), shrunk toward the global median ' + DATA.calibration.global_median.toFixed(3) + ', then moved by the size factor for this protocol\u2019s TVL. The range is the model\u2019s measured holdout error on this snapshot: half of the trading protocols it priced blind landed within x' + DATA.validation.median_factor.toFixed(2) + ' of their actual market cap.'
+        : 'No protocol in ' + (row.category || 'this category') + ' trades in this snapshot, so the multiple is the global median ' + DATA.calibration.global_median.toFixed(3) + ' measured across ' + DATA.calibration.peer_count + ' trading protocols, moved by the size factor for this protocol\u2019s TVL. The range is the model\u2019s measured holdout error on this snapshot: half of the trading protocols it priced blind landed within x' + DATA.validation.median_factor.toFixed(2) + ' of their actual market cap.' }),
       el('p', { class: 'why', text: row.why }),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
     ));
@@ -477,9 +482,10 @@
             metric('Seven-day move', function (r) { return fmtPct(r.change_7d); }),
             metric('Age with no token', function (r) { return fmtAge(r.age_days); }),
             metric('Category multiple', function (r) { return 'x' + r.category_multiple.toFixed(3); }),
+            metric('Size multiplier', function (r) { return 'x' + (r.size_multiplier || 1).toFixed(3); }),
             metric('Trading peers behind it', function (r) { return String(r.peer_count); }),
             metric('Implied value', function (r) { return fmtUsd(r.implied_value_usd); }),
-            metric('Implied range (multiple -25% / +25%)', function (r) { return fmtUsd(r.implied_low_usd) + ' - ' + fmtUsd(r.implied_high_usd); }),
+            metric('Implied range (measured holdout band)', function (r) { return fmtUsd(r.implied_low_usd) + ' - ' + fmtUsd(r.implied_high_usd); }),
             metric('Farm capital', function (r) { return '$' + capitalFor(r); }),
             metric('Farm hold', function (r) { return holdDaysFor(r.age_days) + ' days'; })
           )
@@ -520,7 +526,7 @@
     var body = el('div', { class: 'guide-body' },
       el('p', null,
         el('b', { text: 'What is an implied value? ' }),
-        'Not a price target. It is the market cap a protocol would carry if the market paid it the same multiple of TVL it pays its trading peers today. A protocol far above its peers\u2019 multiple is not predicted to fall, and one far below is not promised to rise; the number says where the model\u2019s centre is, and the detail view shows the range when the multiple moves a quarter either way.'
+        'Not a price target. It is the market cap a protocol would carry if the market paid it the same multiple of TVL it pays its trading peers today, adjusted for its size the way the snapshot\u2019s peers say size is priced. A protocol far above its peers\u2019 multiple is not predicted to fall, and one far below is not promised to rise; the number says where the model\u2019s centre is, and the detail view shows the range the model\u2019s own blind test measured: half of the trading protocols it priced without seeing them landed inside that band.'
       ),
       el('p', null,
         el('b', { text: 'Why does the watchlist matter? ' }),
