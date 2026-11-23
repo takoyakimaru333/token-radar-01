@@ -8,20 +8,29 @@
 //
 // Implied value is calibrated from the snapshot itself, not asserted. Protocols that already trade
 // reveal what the market pays per dollar of TVL in each category: the ratio market cap / TVL. The
-// model takes each category's median ratio and shrinks it toward the global median (weight
-// SHRINK_K peers), because a median over three peers is a hint, not a measurement. A pre-token
-// protocol is then valued as if its category's market applied to it:
+// model works in log space (ratios span orders of magnitude, so the centre it takes is the
+// geometric median) and shrinks each category toward the global centre (weight SHRINK_K peers),
+// because a median over three peers is a hint, not a measurement. It also fits, from the same
+// peers, how much less the market pays per TVL dollar the larger a protocol is: a single size
+// slope, estimated within categories and clamped to [-0.8, 0], applied against each category's
+// own typical size. A pre-token protocol is then valued as if its category's market applied to it:
 //
-//   multiple   = (peers x category_median + SHRINK_K x global_median) / (peers + SHRINK_K)
-//                (peer ratios winsorised at their 95th percentile first)
-//   base       = tvl_usd x multiple
+//   logMultiple = (peers x (category_median_log + beta x (logTVL - category_median_logTVL))
+//                + SHRINK_K x (global_median_log + beta x (logTVL - global_median_logTVL)))
+//                / (peers + SHRINK_K)     (peer ratios winsorised at their 95th percentile first)
+//   base       = tvl_usd x 10^logMultiple
 //   growth     = clamp(change_7d, -60, 120) per cent
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
 //   implied    = max(1, round(base x growthMult x maturity))
 //
+// The model grades itself on the same snapshot: every trading peer is priced blind, left out of
+// its own calibration, and the miss against its actual market cap is measured (validateModel).
+// The dashboard states those measured errors and each row's range is that measured factor, so
+// any reader can re-derive every number on the board, including how wrong it usually is.
+//
 // No protocol name is ever special-cased: the same function scores every row, and the dashboard
-// states the calibration table it derived, so any reader can re-derive every number on the board.
+// states the calibration table it derived.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -70,7 +79,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -82,8 +91,12 @@ export const LIVE_ROWS = 24;
 export interface CategoryCalibration {
   category: string;
   peers: number;
+  /** The geometric median of the peers' ratios: the centre in log space, back in ratio units. */
   median_ratio: number;
+  /** The multiple at the category's own typical size: its shrunk geometric median. */
   multiple: number;
+  /** The category's typical size: the median of its peers' log10(TVL). */
+  median_log_tvl: number;
 }
 
 /** The whole calibration derived from one snapshot. */
@@ -92,7 +105,25 @@ export interface Calibration {
   peer_count: number;
   shrink_k: number;
   ratio_cap: number;
+  /** The fitted size slope: how many log10 of ratio a log10 of TVL costs, within categories. */
+  beta: number;
+  /** The market's typical size: the median of all peers' log10(TVL). */
+  global_median_log_tvl: number;
   categories: CategoryCalibration[];
+}
+
+/**
+ * The model's report card on one snapshot: every trading peer priced blind (left out of its
+ * own calibration) and the miss against its actual market cap, in log10. median_factor is
+ * 10^median_abs_log_error: half of the blind prices landed within that factor of the truth.
+ */
+export interface Validation {
+  peers: number;
+  median_abs_log_error: number;
+  median_factor: number;
+  within_2x_pct: number;
+  within_3x_pct: number;
+  beta: number;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -120,6 +151,7 @@ export interface BoardRow {
   implied_value_usd: number;
   model: {
     category_multiple: number;
+    size_multiplier: number;
     peer_count: number;
     peer_median: number | null;
     growth_pct: number;
@@ -146,6 +178,7 @@ export interface RadarRow {
   implied_low_usd: number;
   implied_high_usd: number;
   category_multiple: number;
+  size_multiplier: number;
   peer_count: number;
   peer_median: number | null;
   growth_multiplier: number;
@@ -173,6 +206,7 @@ export interface RadarData {
   model: ModelConstants;
   model_version: string;
   calibration: Calibration;
+  validation: Validation;
   watchlist_size: number;
   board_size: number;
   early_size: number;
@@ -232,76 +266,171 @@ export function explainRow(row: BoardRow): string {
     ? `a multiple of ${m.category_multiple} calibrated on ${m.peer_count} trading peer${m.peer_count === 1 ? '' : 's'} in ${row.category ?? 'its category'}`
     : `the global median multiple of ${m.category_multiple}, because no protocol in ${row.category ?? 'its category'} trades in this snapshot`;
   const growth = m.growth_pct === 0 ? 'no seven-day growth adjustment' : `a ${m.growth_pct}% seven-day move (x${m.growth_multiplier})`;
-  return `${row.name} is priced from ${origin}, ${growth} and a maturity factor of x${m.maturity_multiplier} for ${m.age_days === null ? 'an unknown time' : `${m.age_days} days`} with no token on record.`;
+  const size = Math.abs(m.size_multiplier - 1) < 0.01 ? 'no size adjustment' : `a size factor of x${m.size_multiplier} for its TVL against its category's typical size`;
+  return `${row.name} is priced from ${origin}, ${size}, ${growth} and a maturity factor of x${m.maturity_multiplier} for ${m.age_days === null ? 'an unknown time' : `${m.age_days} days`} with no token on record.`;
+}
+
+/** One peer in log space: its category, its winsorised log ratio and its log TVL. */
+interface PeerLog {
+  category: string;
+  logRatio: number;
+  logTvl: number;
 }
 
 /**
  * What the snapshot's own trading protocols say a dollar of TVL is worth, per category.
- * Peers are protocols with a recorded market cap; their ratio is mcap / TVL. Each category's
- * median is shrunk toward the global median so thin categories borrow the market's centre
- * instead of swinging on two or three prints.
+ * Peers are protocols with a recorded market cap; their ratio is mcap / TVL. The centre is
+ * taken in log space (the geometric median) because ratios span orders of magnitude, and each
+ * category is shrunk toward the global centre so thin categories borrow the market's centre
+ * instead of swinging on two or three prints. The size slope is fitted on the same peers,
+ * within categories: how much of the log ratio a log of TVL costs, pooled across categories
+ * so no thin category fits its own noise, and clamped to [-0.8, 0] — larger protocols never
+ * pay more per dollar for being larger, and the slope never runs away on a strange snapshot.
  */
 export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
-  const raw: { category: string; ratio: number }[] = [];
-  for (const p of snapshot.protocols) {
+  return calibrateFrom(snapshot.protocols, model);
+}
+
+/** calibrate() over an explicit protocol list: the holdout validation prices peers one by one. */
+function calibrateFrom(protocols: SnapshotProtocol[], model: ModelConstants): Calibration {
+  const raw: { category: string; ratio: number; tvl: number }[] = [];
+  for (const p of protocols) {
     if (p.mcap_usd === null || p.tvl_usd <= 0) continue;
     const ratio = p.mcap_usd / p.tvl_usd;
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
-    raw.push({ category: p.category ?? '', ratio });
+    raw.push({ category: p.category ?? '', ratio, tvl: p.tvl_usd });
   }
   // Winsorise at the 95th percentile: a handful of peers print ratios in the tens or hundreds
   // because their recorded TVL is a sliver of their business. Left raw, one such print would set
   // a whole category's price; capped at the 95th percentile it still counts, at the edge of what
   // the market demonstrably pays.
   const cap = raw.length > 0 ? percentile(raw.map((r) => r.ratio), 0.95) : 0.25;
-  const byCategory = new Map<string, number[]>();
-  const all: number[] = [];
-  for (const r of raw) {
-    const capped = Math.min(r.ratio, cap);
-    all.push(capped);
-    const list = byCategory.get(r.category);
-    if (list === undefined) byCategory.set(r.category, [capped]);
-    else list.push(capped);
+  const peers: PeerLog[] = raw.map((r) => ({
+    category: r.category,
+    logRatio: Math.log10(Math.min(r.ratio, cap)),
+    logTvl: Math.log10(r.tvl),
+  }));
+  const byCategory = new Map<string, PeerLog[]>();
+  for (const peer of peers) {
+    const list = byCategory.get(peer.category);
+    if (list === undefined) byCategory.set(peer.category, [peer]);
+    else list.push(peer);
   }
-  const globalMedian = all.length > 0 ? median(all) : 0.25;
+  const globalLogMedian = peers.length > 0 ? median(peers.map((p) => p.logRatio)) : Math.log10(0.25);
+  const globalLogTvl = peers.length > 0 ? median(peers.map((p) => p.logTvl)) : 0;
+  // The within-category slope: demean each peer by its own category's means, then pool.
+  let num = 0;
+  let den = 0;
+  for (const list of byCategory.values()) {
+    const mx = list.reduce((a, p) => a + p.logTvl, 0) / list.length;
+    const my = list.reduce((a, p) => a + p.logRatio, 0) / list.length;
+    for (const p of list) {
+      num += (p.logTvl - mx) * (p.logRatio - my);
+      den += (p.logTvl - mx) ** 2;
+    }
+  }
+  const beta = den > 0 ? Math.max(-0.8, Math.min(0, num / den)) : 0;
   const categories: CategoryCalibration[] = [];
-  for (const [category, ratios] of byCategory) {
-    const med = median(ratios);
+  for (const [category, list] of byCategory) {
+    const medLog = median(list.map((p) => p.logRatio));
+    const medLogTvl = median(list.map((p) => p.logTvl));
+    // The anchor multiple: the shrunk centre at the category's own typical size, where the
+    // category's slope term is zero and the global term is priced at that same size.
+    const globalAtAnchor = globalLogMedian + beta * (medLogTvl - globalLogTvl);
+    const anchorLog = (list.length * medLog + model.shrink_k * globalAtAnchor) / (list.length + model.shrink_k);
     categories.push({
       category,
-      peers: ratios.length,
-      median_ratio: round4(med),
-      multiple: round4((ratios.length * med + model.shrink_k * globalMedian) / (ratios.length + model.shrink_k)),
+      peers: list.length,
+      median_ratio: round4(10 ** medLog),
+      multiple: round4(10 ** anchorLog),
+      median_log_tvl: round4(medLogTvl),
     });
   }
   categories.sort((a, b) => (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
-  return { global_median: round4(globalMedian), peer_count: all.length, shrink_k: model.shrink_k, ratio_cap: round4(cap), categories };
+  return {
+    global_median: round4(10 ** globalLogMedian),
+    peer_count: peers.length,
+    shrink_k: model.shrink_k,
+    ratio_cap: round4(cap),
+    beta: round4(beta),
+    global_median_log_tvl: round4(globalLogTvl),
+    categories,
+  };
 }
 
-/** The multiple one protocol's category carries, and the peers behind it. */
-function multipleFor(cal: Calibration, category: string | null): { multiple: number; peers: number; medianRatio: number | null } {
+/**
+ * The multiple one protocol carries at its own TVL: its category's shrunk centre, moved by the
+ * size slope from the category's typical size to this protocol's size. The slope term is the
+ * same in the category part and the global part of the blend, so the size multiplier factors
+ * out exactly: 10^(beta x (logTVL - the anchor's median logTVL)), 1 when TVL is not positive.
+ */
+function multipleFor(
+  cal: Calibration,
+  category: string | null,
+  tvl: number,
+): { multiple: number; anchorMultiple: number; sizeMultiplier: number; peers: number; medianRatio: number | null } {
   const hit = cal.categories.find((c) => c.category === (category ?? ''));
-  if (hit !== undefined) return { multiple: hit.multiple, peers: hit.peers, medianRatio: hit.median_ratio };
-  return { multiple: cal.global_median, peers: 0, medianRatio: null };
+  const anchorLogTvl = hit !== undefined ? hit.median_log_tvl : cal.global_median_log_tvl;
+  // Rounded to the same 4 places the board publishes: the dashboard recomputes each row from
+  // the published anchor multiple and size multiplier, and the two must agree to the dollar.
+  const sizeMultiplier = tvl > 0 ? round4(10 ** (cal.beta * (Math.log10(tvl) - anchorLogTvl))) : 1;
+  if (hit !== undefined) {
+    return { multiple: hit.multiple * sizeMultiplier, anchorMultiple: hit.multiple, sizeMultiplier, peers: hit.peers, medianRatio: hit.median_ratio };
+  }
+  return { multiple: cal.global_median * sizeMultiplier, anchorMultiple: cal.global_median, sizeMultiplier, peers: 0, medianRatio: null };
 }
 
-/** The three multipliers and the implied value one protocol gets under `model` and `cal`. */
+/** The multipliers and the implied value one protocol gets under `model` and `cal`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
   cal: Calibration,
-): { implied: number; multiple: number; peers: number; medianRatio: number | null; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+): { implied: number; multiple: number; anchorMultiple: number; sizeMultiplier: number; peers: number; medianRatio: number | null; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const { multiple, peers, medianRatio } = multipleFor(cal, protocol.category);
-  const base = protocol.tvl_usd * multiple;
+  const priced = multipleFor(cal, protocol.category, protocol.tvl_usd);
+  const base = protocol.tvl_usd * priced.multiple;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, multiple, peers, medianRatio, growthPct, growthMult, maturityMult, age };
+  return { implied, multiple: priced.multiple, anchorMultiple: priced.anchorMultiple, sizeMultiplier: priced.sizeMultiplier, peers: priced.peers, medianRatio: priced.medianRatio, growthPct, growthMult, maturityMult, age };
+}
+
+/**
+ * The model graded on its own snapshot: every trading peer with a real market cap is priced
+ * blind — recalibrated without it, then priced by the same function that prices the board —
+ * and the miss against its actual market cap is collected. Exchange peers are left out of the
+ * targets (the board never ranks exchanges) but stay in the calibration pool, as they do when
+ * the board is priced. This is the number the dashboard quotes and the rows' ranges come from:
+ * measured on this snapshot, not asserted from another one.
+ */
+export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL): Validation {
+  const targets = snapshot.protocols.filter(
+    (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.category !== 'CEX',
+  );
+  const errors: number[] = [];
+  for (const target of targets) {
+    const rest = snapshot.protocols.filter((p) => p.slug !== target.slug);
+    const cal = calibrateFrom(rest, model);
+    const v = impliedValue(target, snapshot.as_of, model, cal);
+    errors.push(Math.abs(Math.log10(v.implied / target.mcap_usd!)));
+  }
+  if (errors.length === 0) {
+    return { peers: 0, median_abs_log_error: 0, median_factor: 1, within_2x_pct: 0, within_3x_pct: 0, beta: calibrate(snapshot, model).beta };
+  }
+  const med = median(errors);
+  const within = (factor: number): number => Math.round((errors.filter((e) => e < Math.log10(factor)).length / errors.length) * 100);
+  return {
+    peers: errors.length,
+    median_abs_log_error: round4(med),
+    median_factor: Math.round(10 ** med * 100) / 100,
+    within_2x_pct: within(2),
+    within_3x_pct: within(3),
+    beta: calibrate(snapshot, model).beta,
+  };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -373,7 +502,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      category_multiple: s.multiple,
+      category_multiple: s.anchorMultiple,
+      size_multiplier: round4(s.sizeMultiplier),
       peer_count: s.peers,
       peer_median: s.medianRatio,
       growth_pct: s.growthPct,
@@ -548,17 +678,12 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 }
 
 /**
- * The same row priced at a different multiple: the sensitivity the detail view shows, so a
- * reader sees a range (the multiple a quarter lower, the multiple a quarter higher) instead
- * of one point estimate pretending to be exact.
+ * A board row's compact form for data.js, with the farm plan generated in the page. The range
+ * is the model's measured holdout factor from validateModel: half of the trading peers this
+ * same function priced blind landed within that factor of their actual market cap, so the
+ * range is a measured error band on this snapshot, not a round-number sensitivity.
  */
-function impliedAt(row: BoardRow, multiple: number): number {
-  const m = row.model;
-  return Math.max(1, Math.round(row.tvl_usd * multiple * m.growth_multiplier * m.maturity_multiplier));
-}
-
-/** A board row's compact form for data.js, with the farm plan generated in the page. */
-export function radarRow(row: BoardRow, watchlist: ReadonlySet<string>): RadarRow {
+export function radarRow(row: BoardRow, watchlist: ReadonlySet<string>, factor: number): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -571,9 +696,10 @@ export function radarRow(row: BoardRow, watchlist: ReadonlySet<string>): RadarRo
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
-    implied_low_usd: impliedAt(row, row.model.category_multiple * 0.75),
-    implied_high_usd: impliedAt(row, row.model.category_multiple * 1.25),
+    implied_low_usd: Math.max(1, Math.round(row.implied_value_usd / factor)),
+    implied_high_usd: Math.round(row.implied_value_usd * factor),
     category_multiple: row.model.category_multiple,
+    size_multiplier: row.model.size_multiplier,
     peer_count: row.model.peer_count,
     peer_median: row.model.peer_median,
     growth_multiplier: row.model.growth_multiplier,
@@ -588,6 +714,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const cal = calibrate(snapshot, model);
+  const validation = validateModel(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -596,11 +723,12 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     model,
     model_version: MODEL_VERSION,
     calibration: cal,
+    validation,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
     live_size: live.length,
-    rows: board.map((row) => radarRow(row, new Set(snapshot.watchlist))),
+    rows: board.map((row) => radarRow(row, new Set(snapshot.watchlist), validation.median_factor)),
     live,
   };
   return { board, radar };
